@@ -3,6 +3,7 @@
 
 # 看板是每次运行重新生成的产物，由 Pages artifact 交付，不入库
 output/
+backfill.log
 
 __pycache__/
 *.py[cod]

@@ -25,10 +25,23 @@ GitHub Actions (工作日北京时间 16:00)
 
 ## 看板能做什么
 
-- **切换历史日期**：下拉选任意已归档的交易日
+- **选任意历史日期**：日历控件直接挑，也能用下拉列表或 ←/→ 逐个交易日翻。
+  选到周末或节假日会自动跳到最近的已归档交易日并给出提示。
 - **按列排序**：点表头，数值列按数值排、文本列按拼音排
 - **关键词筛选**：股票名称 / 代码 / 上榜指标都能搜
 - 自适应深浅色，手机上也能看
+
+### 页面结构
+
+```
+output/
+  index.html            # 外壳，7.7 KB，不随历史增长
+  data/manifest.json    # 可用日期清单 + 指标文案表
+  data/20260821.json    # 单日数据，约 7.6 KB，切到哪天才 fetch 哪天
+```
+
+一开始是把所有数据塞进单个 HTML 的，10 KB/交易日——3 年历史会变成 7 MB 的首屏。
+拆成按日 JSON 之后首屏恒定 7.7 KB，归档再深也不影响打开速度。
 
 ## 邮件里有什么
 
@@ -47,25 +60,31 @@ GitHub Actions 的 runner 每次都是全新的临时环境，`data/` 不会自�
 （参考 `Index_Enhancement_Monitor` 的做法）：
 
 1. **提交回仓库**（主）：每次运行后 `git add data/ && git commit && git push`，
-   历史数据随仓库一起版本化。单日 parquet 约 9 KB，一年约 2 MB，完全不占地方。
+   历史数据随仓库一起版本化。单日 parquet 约 9 KB，3 年约 6.6 MB，完全不占地方。
 2. **`actions/cache`**（兜底）：万一某次 push 撞上冲突没提交成功，下次运行仍能从缓存
    恢复。key 用 `github.run_id` 保证每次写新条目，`restore-keys` 前缀匹配拿回最近一份。
 
-脚本侧配合的是 **parquet 优先**：`load_or_fetch()` 发现本地已有该日文件就直接读，
-不再请求新浪。所以重复运行、回补历史都不会浪费请求。
+脚本侧有两本账，保证同一天永远只问新浪一次：
 
-### 首次攒历史
+- **`data/lhb_YYYYMMDD.parquet`** —— 有数据的日子。`load_or_fetch()` 见到就直接读。
+- **`data/_no_data.json`** —— 非交易日。这类日子不产生 parquet，不单独记一笔的话，
+  每次回补都会把三年里近千个周末和节假日重新请求一遍。
 
-仓库里已带了 8 个交易日的数据。要更多历史就跑一次回补：
+### 攒历史
 
-Actions → **LHB Daily** → Run workflow → **backfill** 填 `60` → 运行。
-会把最近 60 个自然日里的交易日全部补齐（已存在的跳过），完成后提交回仓库。
+仓库里已归档约 3 年。要往更早补就跑一次回补（数据源可回溯到 2010 年）：
+
+Actions → **LHB Daily** → Run workflow → **backfill** 填天数 → 运行。
+已归档的日期会瞬间跳过，只请求缺的那些，完成后提交回仓库。
 
 本地跑也一样：
 
 ```bash
-python fetch_lhb.py --backfill 60 --no-email
+python fetch_lhb.py --backfill 1095 --no-email    # 近 3 年
 ```
+
+回补每次请求间隔 1.5 秒，1000 个缺口约需 1 小时。中途 Ctrl+C 也不会白跑——
+已抓到的都落了盘，非交易日台账每 50 次落一次盘，重跑会接着上次继续。
 
 ## 部署步骤
 
@@ -123,7 +142,12 @@ python fetch_lhb.py --date 2026-08-21            # 抓取 + 生成 + 发信（�
 python fetch_lhb.py --email-only --page-url URL  # 只发信，复用已有 parquet
 ```
 
-浏览器直接打开 `output/index.html` 就能看看板效果。
+本地预览看板要起一个 HTTP 服务，**不能直接双击打开** `output/index.html`——
+页面按需 `fetch` 单日 JSON，`file://` 协议会被浏览器同源策略拦住（页面会给出提示）：
+
+```bash
+cd output && python -m http.server 8000    # 然后访问 http://localhost:8000
+```
 
 Windows PowerShell 下设置环境变量：
 
@@ -142,8 +166,8 @@ $env:EMAIL_RECEIVER="a@163.com"; $env:SMTP_SERVER="smtp.163.com"; $env:SMTP_PORT
   （如 `ak.stock_lhb_jgmmtj_em`），`AMOUNT_COL_CANDIDATES` 会自动优先用它。
 - **同一只股票可能有多行**：命中多个上榜指标就会重复出现。parquet 保留全部原始行，
   展示时按股票代码去重，所以「上榜记录」数会大于「涉及个股」数。
-- **看板体积**：约 10 KB/交易日，默认最多嵌入最近 120 天（`MAX_HISTORY_DAYS`），
-  更早的数据仍完整保存在 `data/` 里。实际大小每次运行都会打进日志。
+- **看板体积**：外壳恒定 7.7 KB，单日 JSON 约 7.6 KB 按需加载，归档多深都不影响
+  首屏。全站大小每次运行都会打进日志。
 - **Pages 是公开的**：public 仓库的 Pages 任何人都能访问。龙虎榜本身是公开数据，
   但要知道这一点。
 - 非交易日、接口无数据时跳过发信，退出码 0（Actions 不会标红）。
