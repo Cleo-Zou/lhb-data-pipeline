@@ -1,0 +1,8 @@
+# 生成的数据文件不入库（通过邮件附件 / Actions artifact 交付）
+data/
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
