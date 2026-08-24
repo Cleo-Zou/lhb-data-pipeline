@@ -7,11 +7,19 @@ on:
   workflow_dispatch:
     inputs:
       date:
-        description: '手动指定日期 YYYYMMDD（留空则取昨天）'
+        description: '手动指定日期 YYYYMMDD 或 YYYY-MM-DD（留空则取昨天）'
         required: false
         type: string
+      backfill:
+        description: '回补最近 N 天历史（0=不回补，首次攒历史建议填 60）'
+        required: false
+        default: '0'
+        type: string
 
-# 同一时间只跑一个实例，避免手动触发与定时任务撞车
+# 需要写权限把 data/ 提交回仓库——runner 是临时的，历史只能靠这个累积
+permissions:
+  contents: write
+
 concurrency:
   group: lhb-daily
   cancel-in-progress: false
@@ -19,24 +27,33 @@ concurrency:
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
 
     steps:
-      - name: Checkout
+      - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: 安装 Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install dependencies
+      - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Fetch LHB data and send email
+      # 兜底层：万一某次 push 冲突没提交上，下次运行仍能从缓存拿回历史
+      - name: 恢复数据缓存
+        uses: actions/cache@v4
+        with:
+          path: data/
+          key: lhb-data-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            lhb-data-${{ runner.os }}-
+
+      - name: 抓取数据并发送邮件
         env:
           EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
@@ -45,15 +62,39 @@ jobs:
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           # 经环境变量传入，不要直接把 inputs 插值进 run 里（脚本注入风险）
           LHB_DATE: ${{ inputs.date }}
+          LHB_BACKFILL: ${{ inputs.backfill }}
         run: |
+          args=()
           if [ -n "$LHB_DATE" ]; then
-            python fetch_lhb.py --date "$LHB_DATE"
+            args+=(--date "$LHB_DATE")
+          fi
+          if [ -n "$LHB_BACKFILL" ] && [ "$LHB_BACKFILL" != "0" ]; then
+            args+=(--backfill "$LHB_BACKFILL")
+          fi
+          python fetch_lhb.py "${args[@]}"
+
+      - name: 汇总本地历史
+        if: always()
+        run: |
+          count=$(ls data/lhb_*.parquet 2>/dev/null | wc -l)
+          echo "本地已归档 $count 个交易日"
+          ls -1 data/lhb_*.parquet 2>/dev/null | tail -5 || true
+
+      - name: 提交数据到仓库
+        if: always()
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add data/
+          if git diff --cached --quiet; then
+            echo "无新增数据，跳过提交"
           else
-            python fetch_lhb.py
+            git commit -m "data: 龙虎榜数据更新 $(date -u +%Y-%m-%d)"
+            git pull --rebase --autostash origin main || true
+            git push origin HEAD:main || echo "push 失败（冲突或权限），数据已进缓存，下次运行可恢复"
           fi
 
-      # 兜底：即使邮件发送失败，数据仍可从 Actions 页面下载（保留 30 天）
-      - name: Upload parquet as artifact
+      - name: 上传产物
         if: always()
         uses: actions/upload-artifact@v4
         with:

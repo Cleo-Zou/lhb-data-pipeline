@@ -1,5 +1,6 @@
-# 生成的数据文件不入库（通过邮件附件 / Actions artifact 交付）
-data/
+# data/*.parquet 需要入库：Actions runner 是临时的，历史数据靠提交回仓库累积
+# （参考 Index_Enhancement_Monitor 对 data/return/ 的处理）
+lhb_report.html
 
 __pycache__/
 *.py[cod]

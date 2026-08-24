@@ -1,0 +1,2 @@
+# parquet 是二进制，绝不能让 CRLF 转换碰它（会直接损坏文件）
+*.parquet binary
