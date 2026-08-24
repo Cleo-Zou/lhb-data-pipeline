@@ -16,18 +16,23 @@ on:
         default: '0'
         type: string
 
-# 需要写权限把 data/ 提交回仓库——runner 是临时的，历史只能靠这个累积
 permissions:
-  contents: write
+  contents: write     # 把 data/ 提交回仓库，历史靠这个累积
+  pages: write        # 部署 GitHub Pages
+  id-token: write     # deploy-pages 需要 OIDC
 
+# Pages 部署不可并发；这里还要提交数据，中途取消会留下脏状态，所以不取消
 concurrency:
-  group: lhb-daily
+  group: pages
   cancel-in-progress: false
 
 jobs:
-  fetch:
+  build-and-deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
       - name: 检出代码
@@ -53,18 +58,13 @@ jobs:
           restore-keys: |
             lhb-data-${{ runner.os }}-
 
-      - name: 抓取数据并发送邮件
+      - name: 抓取数据并生成看板
         env:
-          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
-          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
           # 经环境变量传入，不要直接把 inputs 插值进 run 里（脚本注入风险）
           LHB_DATE: ${{ inputs.date }}
           LHB_BACKFILL: ${{ inputs.backfill }}
         run: |
-          args=()
+          args=(--no-email)
           if [ -n "$LHB_DATE" ]; then
             args+=(--date "$LHB_DATE")
           fi
@@ -74,14 +74,11 @@ jobs:
           python fetch_lhb.py "${args[@]}"
 
       - name: 汇总本地历史
-        if: always()
         run: |
-          count=$(ls data/lhb_*.parquet 2>/dev/null | wc -l)
-          echo "本地已归档 $count 个交易日"
-          ls -1 data/lhb_*.parquet 2>/dev/null | tail -5 || true
+          echo "已归档 $(ls data/lhb_*.parquet 2>/dev/null | wc -l) 个交易日"
+          ls -1 data/lhb_*.parquet 2>/dev/null | tail -3 || true
 
       - name: 提交数据到仓库
-        if: always()
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
@@ -94,11 +91,45 @@ jobs:
             git push origin HEAD:main || echo "push 失败（冲突或权限），数据已进缓存，下次运行可恢复"
           fi
 
+      - name: 配置 GitHub Pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true      # 仓库没开 Pages 时自动开启，省掉手动设置
+
       - name: 上传产物
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: output/
+
+      - name: 部署到 GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      # 邮件必须在部署之后发，才拿得到 page_url
+      - name: 发送邮件
+        if: success()
+        env:
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          PAGE_URL: ${{ steps.deployment.outputs.page_url }}
+          LHB_DATE: ${{ inputs.date }}
+        run: |
+          args=(--email-only)
+          if [ -n "$LHB_DATE" ]; then
+            args+=(--date "$LHB_DATE")
+          fi
+          python fetch_lhb.py "${args[@]}"
+
+      - name: 上传产物存档
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: lhb-data
-          path: data/*.parquet
+          path: |
+            data/*.parquet
+            output/index.html
           retention-days: 30
           if-no-files-found: ignore

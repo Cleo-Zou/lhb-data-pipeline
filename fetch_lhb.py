@@ -5,13 +5,15 @@
 数据源: akshare `stock_lhb_detail_daily_sina`（新浪财经，免费、无需 Token）
 
 每个交易日的数据首次抓取后落成 data/lhb_YYYYMMDD.parquet，之后复用不再重复请求。
-邮件正文是当日榜单的 HTML 表格，附件是一个可切换历史日期的独立 HTML 页面。
+再由全部历史 parquet 生成 output/index.html（可切换日期的看板，部署到 GitHub Pages），
+邮件正文放当日榜单表格 + 看板链接。
 
 用法:
     python fetch_lhb.py                    # 抓取昨天（北京时间）的数据
     python fetch_lhb.py --date 2026-08-21  # 抓取指定日期（两种格式都认）
     python fetch_lhb.py --backfill 30      # 回补最近 30 天，攒历史
-    python fetch_lhb.py --no-email         # 只抓取存盘，不发信
+    python fetch_lhb.py --no-email         # 抓取 + 生成看板，不发信
+    python fetch_lhb.py --email-only --page-url https://…   # 只发信（Pages 部署后调用）
 """
 
 from __future__ import annotations
@@ -34,10 +36,11 @@ import pandas as pd
 MAX_RETRIES = 3           # akshare 接口最大重试次数
 RETRY_DELAY = 5           # 重试间隔（秒）
 BACKFILL_DELAY = 1.5      # 回补时每次请求之间的间隔，避免把新浪打急了
-MAX_HISTORY_DAYS = 60     # HTML 附件里最多嵌入多少天，防止附件无限膨胀
+MAX_HISTORY_DAYS = 120    # 页面里最多嵌入多少个交易日，约 10 KB/天
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
+OUTPUT_DIR = ROOT / "output"      # GitHub Pages 部署目录
 CST = timezone(timedelta(hours=8))   # 北京时间，中国无夏令时，固定偏移即可
 
 # 摘要中优先展示的金额字段（新浪日榜无「机构净额」，退化为「成交额」）
@@ -74,7 +77,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--no-email", action="store_true",
-        help="只抓取并保存，不发送邮件（本地调试用）",
+        help="只抓取、生成页面，不发送邮件（本地调试用）",
+    )
+    parser.add_argument(
+        "--email-only", action="store_true",
+        help="不抓取也不生成页面，只发邮件（Actions 里在 Pages 部署完成后调用）",
+    )
+    parser.add_argument(
+        "--page-url", default=None, metavar="URL",
+        help="看板地址，写进邮件正文；也可用环境变量 PAGE_URL",
     )
     return parser.parse_args()
 
@@ -231,7 +242,8 @@ def summarize(df: pd.DataFrame) -> tuple[str | None, pd.DataFrame]:
     return amount_col, view
 
 
-def build_body_html(df: pd.DataFrame, date_str: str, top: int = 10) -> str:
+def build_body_html(df: pd.DataFrame, date_str: str,
+                    page_url: str = "", top: int = 10) -> str:
     """邮件正文：静态 HTML 表格。全部用内联样式，兼容各家邮箱客户端。"""
     amount_col, view = summarize(df)
     stocks = df["股票代码"].nunique() if "股票代码" in df.columns else len(df)
@@ -258,8 +270,15 @@ def build_body_html(df: pd.DataFrame, date_str: str, top: int = 10) -> str:
 
     head = "".join(f'<th style="{th}">{c}</th>' for c in cols)
     more = (f'<p style="color:#656d76;font-size:12px;margin:12px 0 0;">'
-            f'仅显示前 {top} 只，完整 {stocks} 只见附件 HTML（可切换历史日期）。</p>'
+            f'仅显示前 {top} 只，完整 {stocks} 只见在线看板。</p>'
             if stocks > top else "")
+
+    # 看板链接放正文顶部，一眼能点到
+    link = (f'<p style="margin:0 0 20px;"><a href="{page_url}" '
+            f'style="display:inline-block;padding:9px 18px;background:#1f6feb;'
+            f'color:#ffffff;text-decoration:none;border-radius:6px;'
+            f'font-size:14px;font-weight:600;">查看完整看板 · 可切换历史日期 →</a></p>'
+            if page_url else "")
 
     return f"""<!DOCTYPE html><html><body style="margin:0;padding:20px;
 background:#ffffff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',
@@ -271,6 +290,7 @@ background:#ffffff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',
     涉及个股 <b style="color:#1f2328;">{stocks}</b> 只
     {f'· 按 {amount_col} 降序' if amount_col else ''}
   </p>
+  {link}
   <table style="border-collapse:collapse;width:100%;">
     <thead><tr>{head}</tr></thead>
     <tbody>{"".join(rows)}</tbody>
@@ -283,7 +303,8 @@ background:#ffffff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',
 </div></body></html>"""
 
 
-def build_body_text(df: pd.DataFrame, date_str: str, top: int = 5) -> str:
+def build_body_text(df: pd.DataFrame, date_str: str,
+                    page_url: str = "", top: int = 5) -> str:
     """纯文本兜底，给不渲染 HTML 的客户端看。"""
     amount_col, view = summarize(df)
     lines = [
@@ -298,7 +319,8 @@ def build_body_text(df: pd.DataFrame, date_str: str, top: int = 5) -> str:
         code = f" ({r['股票代码']})" if "股票代码" in view.columns else ""
         amt = f"  {amount_col}：{r[amount_col]:,.2f}" if amount_col else ""
         lines.append(f"  {i}. {r.get('股票名称', '')}{code}{amt}")
-    lines += ["", "完整数据见附件 HTML（可切换历史日期）。"]
+    lines += ["", f"完整看板（可切换历史日期）：{page_url}" if page_url
+              else "完整数据见附件 parquet。"]
     return "\n".join(lines)
 
 
@@ -523,8 +545,9 @@ def send_email(subject: str, text_body: str, html_body: str,
 def main() -> int:
     setup_logging()
     args = parse_args()
+    page_url = (args.page_url or os.environ.get("PAGE_URL", "")).strip()
 
-    if args.backfill > 0:
+    if args.backfill > 0 and not args.email_only:
         backfill(args.backfill)
 
     try:
@@ -535,33 +558,45 @@ def main() -> int:
 
     logging.info("=== 龙虎榜任务开始，目标日期 %s ===", date_str)
 
+    # --email-only 只负责发信，本地没有当日数据就直接收工，不要再去请求一次
+    if args.email_only and not parquet_path(date_str).exists():
+        logging.info("%s 无本地数据（非交易日或前序步骤未抓到），无可发送内容", date_str)
+        return EXIT_OK
+
     df = load_or_fetch(date_str)
     if df is None:
         return EXIT_FETCH_FAILED
-    if df.empty:
-        logging.info("%s 无龙虎榜数据（非交易日或当日无个股上榜），跳过发信", date_str)
+
+    no_data = df.empty
+    if no_data:
+        logging.info("%s 无龙虎榜数据（非交易日或当日无个股上榜）", date_str)
+
+    # 看板无论当日有没有数据都要重新生成——否则非交易日那天 Pages 没产物可传
+    if not args.email_only:
+        history = collect_history()
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        out = OUTPUT_DIR / "index.html"
+        out.write_text(build_interactive_html(history, date_str), encoding="utf-8")
+        logging.info("已生成 %s，含 %d 个交易日、%.1f KB",
+                     out.relative_to(ROOT), len(history), out.stat().st_size / 1024)
+
+    if no_data:
+        logging.info("当日无数据，不发邮件")
         return EXIT_OK
 
     if args.no_email:
         logging.info("--no-email 已指定，跳过邮件发送")
-        # 仍然生成一份 HTML，方便本地直接打开看效果
-        out = ROOT / "lhb_report.html"
-        out.write_text(build_interactive_html(collect_history(), date_str), encoding="utf-8")
-        logging.info("已生成 %s（%.1f KB）", out.name, out.stat().st_size / 1024)
         return EXIT_OK
 
-    history = collect_history()
-    report = build_interactive_html(history, date_str)
-    logging.info("HTML 报表已生成，含 %d 个交易日、%.1f KB",
-                 len(history), len(report.encode()) / 1024)
+    if not page_url:
+        logging.warning("未提供 --page-url / PAGE_URL，邮件正文不含看板链接")
 
+    stocks = df["股票代码"].nunique() if "股票代码" in df.columns else len(df)
     send_email(
-        subject=f"【龙虎榜】{_fmt_date(date_str)} 上榜 "
-                f"{df['股票代码'].nunique() if '股票代码' in df.columns else len(df)} 只",
-        text_body=build_body_text(df, date_str),
-        html_body=build_body_html(df, date_str),
+        subject=f"【龙虎榜】{_fmt_date(date_str)} 上榜 {stocks} 只",
+        text_body=build_body_text(df, date_str, page_url),
+        html_body=build_body_html(df, date_str, page_url),
         attachments=[
-            (f"龙虎榜_{date_str}.html", report.encode("utf-8"), "xhtml+xml"),
             (f"lhb_{date_str}.parquet", parquet_path(date_str).read_bytes(), "octet-stream"),
         ],
     )

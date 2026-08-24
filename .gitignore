@@ -1,6 +1,8 @@
 # data/*.parquet 需要入库：Actions runner 是临时的，历史数据靠提交回仓库累积
 # （参考 Index_Enhancement_Monitor 对 data/return/ 的处理）
-lhb_report.html
+
+# 看板是每次运行重新生成的产物，由 Pages artifact 交付，不入库
+output/
 
 __pycache__/
 *.py[cod]
