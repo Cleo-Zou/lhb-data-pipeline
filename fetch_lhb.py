@@ -2,17 +2,20 @@
 # -*- coding: utf-8 -*-
 """A股龙虎榜每日数据获取与邮件推送。
 
-数据源: akshare `stock_lhb_detail_daily_sina`（新浪财经，免费、无需 Token）
+数据源: akshare `stock_lhb_detail_em`（东方财富，免费、无需 Token）。
+相比新浪 `stock_lhb_detail_daily_sina`，东方财富的日榜字段完整得多——
+自带「涨跌幅」，且「上榜原因」对创业板/科创板的 20% 板股票也完整给出
+（新浪接口对这些票返回 NaN），另附龙虎榜净买额、换手率、流通市值等。
 
 每个交易日的数据首次抓取后落成 data/lhb_YYYYMMDD.parquet，之后复用不再重复请求；
 非交易日记进 data/_no_data.json，同样不再重复问。
-再由全部历史 parquet 生成 output/（index.html 外壳 + 按日拆分的 JSON，按需加载），
-部署到 GitHub Pages，邮件正文放当日榜单表格 + 看板链接。
+再由全部历史 parquet 生成自包含的 output/index.html，部署到 GitHub Pages，
+邮件正文放当日榜单表格 + 看板链接。每次运行顺带跑一遍数据自检，异常会写进邮件。
 
 用法:
     python fetch_lhb.py                    # 抓取昨天（北京时间）的数据
     python fetch_lhb.py --date 2026-08-21  # 抓取指定日期（两种格式都认）
-    python fetch_lhb.py --backfill 30      # 回补最近 30 天，攒历史
+    python fetch_lhb.py --backfill 30      # 回补最近 30 天，攒历史（按范围批量）
     python fetch_lhb.py --no-email         # 抓取 + 生成看板，不发信
     python fetch_lhb.py --email-only --page-url https://…   # 只发信（Pages 部署后调用）
 """
@@ -34,16 +37,32 @@ import pandas as pd
 
 # ---------------------------------------------------------------- 配置常量 --
 
-MAX_RETRIES = 3           # akshare 接口最大重试次数
+MAX_RETRIES = 3           # 接口最大重试次数
 RETRY_DELAY = 5           # 重试间隔（秒）
-BACKFILL_DELAY = 1.5      # 回补时每次请求之间的间隔，避免把新浪打急了
+BACKFILL_DELAY = 1.0      # 回补时每次「范围请求」之间的间隔，避免把数据源打急
+BACKFILL_CHUNK = 90       # 回补时每段范围的天数（东方财富支持一次取一个日期范围）
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 OUTPUT_DIR = ROOT / "output"      # GitHub Pages 部署目录
 CST = timezone(timedelta(hours=8))   # 北京时间，中国无夏令时，固定偏移即可
 
-# 摘要中优先展示的金额字段（新浪日榜无「机构净额」，退化为「成交额」）
-AMOUNT_COL_CANDIDATES = ("机构净额", "成交额", "对应值")
+# 摘要中优先展示、按它排序的金额字段（东方财富有「龙虎榜净买额」，最接近「机构净额」）
+AMOUNT_COL_CANDIDATES = ("龙虎榜净买额", "龙虎榜成交额", "换手率")
+
+# 看板/邮件正文展示的列（顺序即展示顺序）
+DISPLAY_COLS = ["股票代码", "股票名称", "收盘价", "涨跌幅",
+                "龙虎榜净买额", "换手率", "上榜原因"]
+
+# 自检必查的列：任何一个 parquet 缺了这些列就算异常
+REQUIRED_COLS = ("股票代码", "股票名称", "收盘价", "涨跌幅", "龙虎榜净买额", "上榜原因")
+
+# 东方财富原始列名 -> 本项目统一列名（其余同名列原样保留）
+COLUMN_MAP = {"代码": "股票代码", "名称": "股票名称"}
+
+# 落盘时保留的列（展示列 + 买入/卖出/成交额，附件 parquet 里更完整）
+KEEP_COLS = ["股票代码", "股票名称", "收盘价", "涨跌幅",
+             "龙虎榜净买额", "龙虎榜买入额", "龙虎榜卖出额", "龙虎榜成交额",
+             "换手率", "上榜原因"]
 
 EXIT_OK = 0
 EXIT_FETCH_FAILED = 1
@@ -109,7 +128,7 @@ def parquet_path(date_str: str) -> Path:
     return DATA_DIR / f"lhb_{date_str}.parquet"
 
 
-# 非交易日不会产生 parquet，不记一笔的话每次回补都会把周末和节假日重新请求一遍
+# 非交易日不会产生 parquet，不记一笔的话回补时会反复请求周末和节假日
 NO_DATA_LEDGER = DATA_DIR / "_no_data.json"
 
 
@@ -131,28 +150,48 @@ def save_no_data(dates: set[str]) -> None:
 
 # ---------------------------------------------------------------- 数据获取 --
 
-def fetch_lhb(date_str: str) -> pd.DataFrame | None:
-    """抓取指定日期的龙虎榜明细，失败重试 MAX_RETRIES 次。
+def _normalize(df: pd.DataFrame) -> pd.DataFrame:
+    """统一列名、清洗关键字段。"""
+    df = df.rename(columns=COLUMN_MAP)
+    # 股票代码保持 6 位字符串，前导零不能丢（如 000065）
+    if "股票代码" in df.columns:
+        df["股票代码"] = df["股票代码"].astype(str).str.zfill(6)
+    # 上榜日：东方财富给的是 datetime.date，统一成 YYYYMMDD 字符串
+    # （单日文件写盘前会丢弃这列，只有范围回补需要它来分组）
+    if "上榜日" in df.columns:
+        df["上榜日"] = df["上榜日"].apply(
+            lambda d: d.strftime("%Y%m%d") if hasattr(d, "strftime")
+            else str(d).replace("-", ""))
+    # 只保留需要落盘的列（上榜日仅用于范围回补分组，写盘前丢弃）
+    keep = [c for c in KEEP_COLS if c in df.columns]
+    if "上榜日" in df.columns:
+        keep.append("上榜日")
+    return df[keep]
 
-    返回 DataFrame；当日无数据（非交易日）时返回空 DataFrame；
+
+def _fetch_range(d0: str, d1: str) -> pd.DataFrame | None:
+    """抓取 [d0, d1] 日期范围内的龙虎榜明细，失败重试。
+
+    返回统一列名后的 DataFrame；该范围无数据（纯周末/节假日）返回空 DataFrame；
     重试耗尽仍失败返回 None。
     """
     import akshare as ak   # 延迟导入：import akshare 本身耗时约数秒
 
+    label = d0 if d0 == d1 else f"{d0}~{d1}"
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             logging.info("正在获取 %s 龙虎榜数据（第 %d/%d 次尝试）…",
-                         date_str, attempt, MAX_RETRIES)
-            df = ak.stock_lhb_detail_daily_sina(date=date_str)
-            if df is None:
-                logging.warning("接口返回 None，视为无数据")
+                         label, attempt, MAX_RETRIES)
+            df = ak.stock_lhb_detail_em(start_date=d0, end_date=d1)
+            if df is None or len(df) == 0:
+                logging.info("%s 无数据表（非交易日或该范围无上榜）", label)
                 return pd.DataFrame()
-            logging.info("接口返回 %d 行、%d 列", len(df), len(df.columns))
-            return df
-        except KeyError as exc:
-            # 非交易日时页面没有数据表，akshare 内部对空 DataFrame 取列会抛
-            # KeyError('股票代码')。这是确定性的「无数据」，重试没有意义。
-            logging.info("%s 无数据表（非交易日），接口抛 KeyError(%s)", date_str, exc)
+            logging.info("接口返回 %d 行", len(df))
+            return _normalize(df)
+        except TypeError as exc:
+            # 纯非交易日时东方财富接口内部对空结果取下标会抛
+            # TypeError("'NoneType' object is not subscriptable")，确定性无数据。
+            logging.info("%s 无数据（非交易日），接口抛 TypeError(%s)", label, exc)
             return pd.DataFrame()
         except Exception as exc:                      # noqa: BLE001 - 接口异常类型不确定
             logging.warning("第 %d 次获取失败: %s: %s",
@@ -161,8 +200,13 @@ def fetch_lhb(date_str: str) -> pd.DataFrame | None:
                 logging.info("%d 秒后重试…", RETRY_DELAY)
                 time.sleep(RETRY_DELAY)
 
-    logging.error("重试 %d 次后仍无法获取 %s 的数据", MAX_RETRIES, date_str)
+    logging.error("重试 %d 次后仍无法获取 %s 的数据", MAX_RETRIES, label)
     return None
+
+
+def fetch_lhb(date_str: str) -> pd.DataFrame | None:
+    """抓取单日（用于每日增量）。"""
+    return _fetch_range(date_str, date_str)
 
 
 def clean(df: pd.DataFrame) -> pd.DataFrame:
@@ -172,6 +216,10 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
 
     for col in df.select_dtypes(include="object").columns:
         df[col] = df[col].astype(str).str.strip().replace({"nan": "", "None": ""})
+
+    # 股票代码缺失或为空的整行直接丢弃
+    if "股票代码" in df.columns:
+        df = df[df["股票代码"].astype(str).str.strip().ne("")]
 
     df = df.drop_duplicates().reset_index(drop=True)
 
@@ -195,7 +243,7 @@ def load_or_fetch(date_str: str) -> pd.DataFrame | None:
     if df is None or df.empty:
         return df
 
-    df = clean(df)
+    df = clean(df).drop(columns=[c for c in ("上榜日",) if c in df.columns])
     if df.empty:
         logging.info("清洗后无有效数据，不保存")
         return df
@@ -208,50 +256,82 @@ def load_or_fetch(date_str: str) -> pd.DataFrame | None:
 
 
 def backfill(days: int) -> None:
-    """回补最近 N 个自然日；已有 parquet 的直接跳过。"""
+    """回补最近 N 个自然日，按范围批量抓取（东方财富支持一次取一个日期范围）。
+
+    已覆盖的日期（有 parquet 或记进台账的）整段跳过，只对缺口分段请求；
+    段内未返回的日期记为 no_data，下次直接跳过。
+    """
     logging.info("=== 开始回补最近 %d 天 ===", days)
     no_data = load_no_data()
-    fetched = skipped = empty = failed = 0
+    # 终点取昨天：今天(交易日)的龙虎榜要到盘后才发布，此刻抓会误判为「无数据」
+    end = (datetime.now(CST) - timedelta(days=1)).date()
+    start = end - timedelta(days=days)
+
+    fetched = skipped = failed = 0
+    cursor = start
 
     try:
-        for i in range(1, days + 1):
-            date_str = (datetime.now(CST) - timedelta(days=i)).strftime("%Y%m%d")
-            if parquet_path(date_str).exists() or date_str in no_data:
-                skipped += 1
+        while cursor <= end:
+            c1 = min(cursor + timedelta(days=BACKFILL_CHUNK - 1), end)
+
+            # 段内每个日期都已覆盖则整段跳过
+            all_covered = True
+            d = cursor
+            while d <= c1:
+                ds = d.strftime("%Y%m%d")
+                if not parquet_path(ds).exists() and ds not in no_data:
+                    all_covered = False
+                    break
+                d += timedelta(days=1)
+            if all_covered:
+                skipped += (c1 - cursor).days + 1
+                cursor = c1 + timedelta(days=1)
                 continue
 
-            df = load_or_fetch(date_str)
+            df = _fetch_range(cursor.strftime("%Y%m%d"), c1.strftime("%Y%m%d"))
             if df is None:
-                logging.warning("%s 抓取失败，跳过", date_str)
                 failed += 1
             elif df.empty:
-                no_data.add(date_str)     # 记一笔，下次不用再问
-                empty += 1
+                d = cursor
+                while d <= c1:
+                    no_data.add(d.strftime("%Y%m%d"))
+                    d += timedelta(days=1)
             else:
-                fetched += 1
+                covered: set[str] = set()
+                for ds, sub in df.groupby("上榜日"):
+                    sub = clean(sub.drop(columns=["上榜日"]).reset_index(drop=True))
+                    if sub.empty:
+                        continue
+                    DATA_DIR.mkdir(parents=True, exist_ok=True)
+                    sub.to_parquet(parquet_path(ds), index=False)
+                    covered.add(ds)
+                    fetched += 1
+                # 段内没出现的日期 = 非交易日，记进台账
+                d = cursor
+                while d <= c1:
+                    ds = d.strftime("%Y%m%d")
+                    if ds not in covered:
+                        no_data.add(ds)
+                    d += timedelta(days=1)
 
-            if (fetched + empty + failed) % 50 == 0:
-                logging.info("进度：已处理 %d/%d，新增 %d 天",
-                             i, days, fetched)
-                save_no_data(no_data)     # 中途落盘，被打断也不白跑
-            time.sleep(BACKFILL_DELAY)    # 别把新浪打急了
+            cursor = c1 + timedelta(days=1)
+            save_no_data(no_data)
+            if fetched % 50 < 20 and fetched > 0:      # 避免日志刷屏，粗略打进度
+                logging.info("进度：已新增 %d 个交易日", fetched)
+            time.sleep(BACKFILL_DELAY)
     finally:
         save_no_data(no_data)
 
-    logging.info("回补完成：新增 %d 天，跳过 %d 天（已有或已知无数据），"
-                 "新记录非交易日 %d 天，失败 %d 天",
-                 fetched, skipped, empty, failed)
+    logging.info("回补完成：新增 %d 个交易日，跳过 %d 天，失败 %d 段",
+                 fetched, skipped, failed)
 
 
 def collect_history(limit: int | None = None) -> list[tuple[str, pd.DataFrame]]:
-    """读取本地所有 parquet，按日期倒序返回。limit=None 表示全部。
-
-    页面按日拆分 JSON、按需加载，所以这里不再需要为体积设上限。
-    """
-    files = sorted(DATA_DIR.glob("lhb_*.parquet"), reverse=True)
+    """读取本地所有 parquet，按日期升序返回。limit=None 表示全部。"""
+    files = sorted(DATA_DIR.glob("lhb_*.parquet"))
     if limit is not None and len(files) > limit:
         logging.info("本地共 %d 天数据，只取最近 %d 天", len(files), limit)
-        files = files[:limit]
+        files = files[-limit:]
 
     history = []
     for f in files:
@@ -268,18 +348,33 @@ def _fmt_date(date_str: str) -> str:
     return f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
 
 
+def _fmt_val(col: str, v) -> str:
+    """数值列的展示格式化：涨跌幅/换手率带 %，净买额折成万元。"""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    if col == "涨跌幅":
+        return f"{v:+.2f}%"
+    if col == "换手率":
+        return f"{v:.2f}%"
+    if col == "龙虎榜净买额":
+        return f"{v / 1e4:,.0f}万"
+    if col == "收盘价":
+        return f"{v:.2f}"
+    return str(v)
+
+
 def summarize(df: pd.DataFrame) -> tuple[str | None, pd.DataFrame]:
     """返回 (金额字段名, 按金额降序且按股票代码去重后的表)。"""
     amount_col = next((c for c in AMOUNT_COL_CANDIDATES if c in df.columns), None)
     view = df.sort_values(amount_col, ascending=False) if amount_col else df
-    # 同一只股票可能因命中多个上榜指标而出现多行，展示时按代码去重避免刷屏
+    # 同一只股票可能因命中多个上榜原因而出现多行，展示时按代码去重避免刷屏
     if "股票代码" in view.columns:
         view = view.drop_duplicates(subset="股票代码")
     return amount_col, view
 
 
-def build_body_html(df: pd.DataFrame, date_str: str,
-                    page_url: str = "", top: int = 10) -> str:
+def build_body_html(df: pd.DataFrame, date_str: str, page_url: str = "",
+                    top: int = 10, health: str = "") -> str:
     """邮件正文：静态 HTML 表格。全部用内联样式，兼容各家邮箱客户端。"""
     amount_col, view = summarize(df)
     stocks = df["股票代码"].nunique() if "股票代码" in df.columns else len(df)
@@ -289,8 +384,7 @@ def build_body_html(df: pd.DataFrame, date_str: str,
           "text-align:left;color:#656d76;font-weight:600;white-space:nowrap;")
     num = td + "text-align:right;font-variant-numeric:tabular-nums;"
 
-    cols = [c for c in ("股票代码", "股票名称", "收盘价", "对应值", "成交额", "指标")
-            if c in view.columns]
+    cols = [c for c in DISPLAY_COLS if c in view.columns]
 
     rows = []
     for i, (_, r) in enumerate(view.head(top).iterrows()):
@@ -298,10 +392,14 @@ def build_body_html(df: pd.DataFrame, date_str: str,
         cells = []
         for c in cols:
             v = r[c]
-            if isinstance(v, (int, float)) and pd.notna(v):
-                cells.append(f'<td style="{num}{bg}">{v:,.2f}</td>')
+            if c == "涨跌幅":
+                color = "#d73a49" if (pd.notna(v) and v >= 0) else "#1a7f37"
+                cells.append(f'<td style="{num}{bg}color:{color};'
+                             f'font-weight:600;">{_fmt_val(c, v)}</td>')
+            elif c in ("收盘价", "龙虎榜净买额", "换手率"):
+                cells.append(f'<td style="{num}{bg}">{_fmt_val(c, v)}</td>')
             else:
-                cells.append(f'<td style="{td}{bg}">{v}</td>')
+                cells.append(f'<td style="{td}{bg}">{_fmt_val(c, v)}</td>')
         rows.append("<tr>" + "".join(cells) + "</tr>")
 
     head = "".join(f'<th style="{th}">{c}</th>' for c in cols)
@@ -309,7 +407,15 @@ def build_body_html(df: pd.DataFrame, date_str: str,
             f'仅显示前 {top} 只，完整 {stocks} 只见在线看板。</p>'
             if stocks > top else "")
 
-    # 看板链接放正文顶部，一眼能点到
+    health_line = ""
+    if health:
+        ok = not health.startswith("⚠")
+        color = "#1a7f37" if ok else "#9a6700"
+        health_line = (f'<p style="margin:0 0 18px;padding:10px 12px;'
+                       f'background:{("#f0fff4" if ok else "#fff8c5")};'
+                       f'border:1px solid {color};border-radius:6px;'
+                       f'color:{color};font-size:13px;">{health}</p>')
+
     link = (f'<p style="margin:0 0 20px;"><a href="{page_url}" '
             f'style="display:inline-block;padding:9px 18px;background:#1f6feb;'
             f'color:#ffffff;text-decoration:none;border-radius:6px;'
@@ -319,13 +425,14 @@ def build_body_html(df: pd.DataFrame, date_str: str,
     return f"""<!DOCTYPE html><html><body style="margin:0;padding:20px;
 background:#ffffff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',
 'Microsoft YaHei',sans-serif;color:#1f2328;">
-<div style="max-width:720px;margin:0 auto;">
+<div style="max-width:760px;margin:0 auto;">
   <h2 style="margin:0 0 4px;font-size:19px;">A股龙虎榜 · {_fmt_date(date_str)}</h2>
   <p style="margin:0 0 18px;color:#656d76;font-size:13px;">
     上榜记录 <b style="color:#1f2328;">{len(df)}</b> 条 ·
     涉及个股 <b style="color:#1f2328;">{stocks}</b> 只
     {f'· 按 {amount_col} 降序' if amount_col else ''}
   </p>
+  {health_line}
   {link}
   <table style="border-collapse:collapse;width:100%;">
     <thead><tr>{head}</tr></thead>
@@ -334,36 +441,41 @@ background:#ffffff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',
   {more}
   <p style="color:#8b949e;font-size:12px;margin:24px 0 0;
      border-top:1px solid #eaeef2;padding-top:12px;">
-    数据来源：新浪财经（akshare） · 本邮件由 GitHub Actions 自动发送
+    数据来源：东方财富（akshare） · 本邮件由 GitHub Actions 自动发送
   </p>
 </div></body></html>"""
 
 
-def build_body_text(df: pd.DataFrame, date_str: str,
-                    page_url: str = "", top: int = 5) -> str:
+def build_body_text(df: pd.DataFrame, date_str: str, page_url: str = "",
+                    top: int = 5, health: str = "") -> str:
     """纯文本兜底，给不渲染 HTML 的客户端看。"""
     amount_col, view = summarize(df)
+    stocks = df["股票代码"].nunique() if "股票代码" in df.columns else len(df)
     lines = [
         f"A股龙虎榜 · {_fmt_date(date_str)}",
         "",
         f"上榜记录：{len(df)} 条",
-        f"涉及个股：{df['股票代码'].nunique() if '股票代码' in df.columns else len(df)} 只",
-        "",
-        f"前{top}条（按 {amount_col or '原始顺序'}）：",
+        f"涉及个股：{stocks} 只",
     ]
+    if health:
+        lines += ["", health]
+    lines += ["", f"前{top}条（按 {amount_col or '原始顺序'}）："]
     for i, (_, r) in enumerate(view.head(top).iterrows(), start=1):
         code = f" ({r['股票代码']})" if "股票代码" in view.columns else ""
-        amt = f"  {amount_col}：{r[amount_col]:,.2f}" if amount_col else ""
-        lines.append(f"  {i}. {r.get('股票名称', '')}{code}{amt}")
+        chg = _fmt_val("涨跌幅", r.get("涨跌幅"))
+        net = _fmt_val("龙虎榜净买额", r.get("龙虎榜净买额"))
+        name = r.get("股票名称", "")
+        lines.append(f"  {i}. {name}{code}  涨跌幅 {chg}  净买额 {net}")
     lines += ["", f"完整看板（可切换历史日期）：{page_url}" if page_url
               else "完整数据见附件 parquet。"]
     return "\n".join(lines)
 
 
-def write_site(history: list[tuple[str, pd.DataFrame]], target: str) -> Path:
+def write_site(history: list[tuple[str, pd.DataFrame]], target: str,
+               health: str = "") -> Path:
     """生成自包含的 output/index.html：所有数据内嵌，页面零 fetch。
 
-    采用列式编码（每列一个数组）+ 股票名称/指标文案全局去重，把体积压到
+    采用列式编码（每列一个数组）+ 股票名称/上榜原因文案全局去重，把体积压到
     行式 JSON 的约 1/3。浏览器只加载 index.html 一个文件，彻底绕开
     「子资源 fetch 被代理/安全软件拦截」这类问题。
     """
@@ -371,8 +483,8 @@ def write_site(history: list[tuple[str, pd.DataFrame]], target: str) -> Path:
 
     names: list[str] = []          # 股票名称去重表
     name_index: dict[str, int] = {}
-    indicators: list[str] = []     # 指标文案去重表
-    ind_index: dict[str, int] = {}
+    reasons: list[str] = []        # 上榜原因去重表
+    reason_index: dict[str, int] = {}
 
     def intern_name(n: str) -> int:
         if n not in name_index:
@@ -390,19 +502,18 @@ def write_site(history: list[tuple[str, pd.DataFrame]], target: str) -> Path:
 
     for date_str, df in history:
         _, view = summarize(df)
-        view = view.drop(columns=[c for c in ("序号",) if c in view.columns])
 
         code = view["股票代码"].astype(str).tolist() if "股票代码" in view.columns else []
         name = [intern_name(str(v)) for v in view["股票名称"]] if "股票名称" in view.columns else []
 
         inds: list[int | None] = []
-        if "指标" in view.columns:
-            for v in view["指标"]:
+        if "上榜原因" in view.columns:
+            for v in view["上榜原因"]:
                 s = str(v)
-                if s not in ind_index:
-                    ind_index[s] = len(indicators)
-                    indicators.append(s)
-                inds.append(ind_index[s])
+                if s not in reason_index:
+                    reason_index[s] = len(reasons)
+                    reasons.append(s)
+                inds.append(reason_index[s])
         else:
             inds = [None] * len(view)
 
@@ -410,13 +521,13 @@ def write_site(history: list[tuple[str, pd.DataFrame]], target: str) -> Path:
             "total": int(len(df)),
             "stocks": int(df["股票代码"].nunique())
                       if "股票代码" in df.columns else int(len(df)),
-            "c": code,          # 股票代码
-            "n": name,          # 股票名称 -> names 下标
+            "c": code,            # 股票代码
+            "n": name,            # 股票名称 -> names 下标
             "close": col(view, "收盘价"),
-            "val": col(view, "对应值"),
-            "vol": col(view, "成交量"),
-            "amt": col(view, "成交额"),
-            "i": inds,          # 指标 -> indicators 下标
+            "chg": col(view, "涨跌幅"),
+            "net": col(view, "龙虎榜净买额"),
+            "turn": col(view, "换手率"),
+            "r": inds,            # 上榜原因 -> reasons 下标
         }
         dates.append(date_str)
 
@@ -424,8 +535,9 @@ def write_site(history: list[tuple[str, pd.DataFrame]], target: str) -> Path:
     payload = {
         "dates": dates,
         "names": names,
-        "indicators": indicators,
+        "reasons": reasons,
         "byDate": by_date,
+        "health": health,
         "generated": datetime.now(CST).strftime("%Y-%m-%d %H:%M"),
     }
     data_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
@@ -450,17 +562,19 @@ SHELL_HTML = r"""<!DOCTYPE html>
   :root {
     --bg:#fff; --fg:#1f2328; --muted:#656d76; --border:#d0d7de;
     --zebra:#f6f8fa; --accent:#1f6feb; --field:#fff; --warn:#9a6700;
+    --up:#d73a49; --down:#1a7f37;
   }
   @media (prefers-color-scheme:dark) {
     :root {
       --bg:#0d1117; --fg:#e6edf3; --muted:#8b949e; --border:#30363d;
       --zebra:#161b22; --accent:#4493f8; --field:#010409; --warn:#d29922;
+      --up:#f85149; --down:#3fb950;
     }
   }
   *{box-sizing:border-box}
   body{margin:0;padding:28px 16px;background:var(--bg);color:var(--fg);
     font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}
-  main{max-width:960px;margin:0 auto}
+  main{max-width:1000px;margin:0 auto}
   h1{font-size:20px;margin:0 0 6px}
   .range{color:var(--muted);font-size:13px;margin:0 0 18px}
   .bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
@@ -473,6 +587,9 @@ SHELL_HTML = r"""<!DOCTYPE html>
   select:focus,input:focus{outline:2px solid var(--accent);outline-offset:-1px}
   .stat{color:var(--muted);font-size:13px;margin-bottom:14px}
   .stat b{color:var(--fg)}
+  .health{font-size:13px;padding:8px 12px;border-radius:6px;margin-bottom:14px}
+  .health.ok{color:var(--down);background:color-mix(in srgb,var(--down) 10%,var(--bg));border:1px solid var(--down)}
+  .health.bad{color:var(--warn);background:color-mix(in srgb,var(--warn) 12%,var(--bg));border:1px solid var(--warn)}
   table{border-collapse:collapse;width:100%;font-size:13px}
   th{text-align:left;padding:9px 10px;border-bottom:2px solid var(--border);
     color:var(--muted);font-size:12px;white-space:nowrap;cursor:pointer;user-select:none}
@@ -480,6 +597,8 @@ SHELL_HTML = r"""<!DOCTYPE html>
   th.num,td.num{text-align:right;font-variant-numeric:tabular-nums}
   td{padding:8px 10px;border-bottom:1px solid var(--border)}
   tbody tr:nth-child(even){background:var(--zebra)}
+  .up{color:var(--up);font-weight:600}
+  .down{color:var(--down);font-weight:600}
   .msg{padding:36px 0;text-align:center;color:var(--muted)}
   .msg.warn{color:var(--warn)}
   footer{margin-top:28px;padding-top:14px;border-top:1px solid var(--border);
@@ -495,7 +614,7 @@ SHELL_HTML = r"""<!DOCTYPE html>
     <input type="date" id="picker">
     <button id="next" title="下一个交易日">→</button>
     <select id="quick"></select>
-    <input id="q" type="text" placeholder="筛选股票名称 / 代码 / 指标…">
+    <input id="q" type="text" placeholder="筛选股票名称 / 代码 / 上榜原因…">
   </div>
   <div class="stat" id="stat"></div>
   <div id="wrap"><div class="msg">加载中…</div></div>
@@ -503,8 +622,8 @@ SHELL_HTML = r"""<!DOCTYPE html>
 </main>
 <script>
 const DATA = __DATA__;
-const COLS = ["股票代码","股票名称","收盘价","对应值","成交量","成交额","指标"];
-const NUM  = new Set(["收盘价","对应值","成交量","成交额"]);
+const COLS = ["股票代码","股票名称","收盘价","涨跌幅","龙虎榜净买额","换手率","上榜原因"];
+const NUM  = new Set(["收盘价","涨跌幅","龙虎榜净买额","换手率"]);
 const $ = id => document.getElementById(id);
 
 let DATES = DATA.dates;
@@ -523,16 +642,26 @@ function rowsOf(d) {
     out[k] = {
       code:  p.c[k],
       name:  p.n[k] != null ? DATA.names[p.n[k]] : "",
-      close: p.close[k], val: p.val[k], vol: p.vol[k], amt: p.amt[k],
-      ind:   p.i[k] != null ? DATA.indicators[p.i[k]] : "",
+      close: p.close[k], chg: p.chg[k], net: p.net[k], turn: p.turn[k],
+      reason: p.r[k] != null ? DATA.reasons[p.r[k]] : "",
     };
   }
   return out;
 }
 const val = (r, c) =>
   c === "股票代码" ? r.code : c === "股票名称" ? r.name :
-  c === "收盘价" ? r.close : c === "对应值" ? r.val :
-  c === "成交量" ? r.vol : c === "成交额" ? r.amt : r.ind;
+  c === "收盘价" ? r.close : c === "涨跌幅" ? r.chg :
+  c === "龙虎榜净买额" ? r.net : c === "换手率" ? r.turn : r.reason;
+
+function fmt(r, c) {
+  const v = val(r, c);
+  if (v == null) return "";
+  if (c === "涨跌幅") return {t: (v > 0 ? "+" : "") + Number(v).toFixed(2) + "%", cls: v >= 0 ? "up" : "down"};
+  if (c === "换手率") return Number(v).toFixed(2) + "%";
+  if (c === "龙虎榜净买额") return (Number(v) / 1e4).toLocaleString("zh-CN", {maximumFractionDigits: 0}) + "万";
+  if (c === "收盘价") return Number(v).toFixed(2);
+  return v;
+}
 
 function boot() {
   if (!DATES.length) { $("wrap").innerHTML = '<div class="msg">暂无归档数据</div>'; return; }
@@ -541,8 +670,15 @@ function boot() {
   $("quick").innerHTML = DATES.map(d => `<option value="${d}">${dashed(d)}</option>`).join("");
   $("range").textContent =
     `已归档 ${DATES.length} 个交易日：${dashed(DATES[DATES.length-1])} ~ ${dashed(DATES[0])}`;
+  const h = DATA.health || "";
+  if (h) {
+    const el = document.createElement("div");
+    el.className = "health " + (h.startsWith("⚠") ? "bad" : "ok");
+    el.textContent = h;
+    $("wrap").before(el);
+  }
   $("foot").textContent =
-    `数据来源：新浪财经（akshare） · 生成于 ${DATA.generated} (UTC+8) · 单文件版`;
+    `数据来源：东方财富（akshare） · 生成于 ${DATA.generated} (UTC+8) · 单文件版`;
   if (!DATES.includes(cur)) cur = DATES[0];
   show(cur);
 }
@@ -593,9 +729,10 @@ function render() {
   const body = rows.map(r => "<tr>" + COLS.map(c => {
     const v = val(r, c);
     if (NUM.has(c)) {
-      const t = (v == null) ? "" : Number(v).toLocaleString("zh-CN",
-        {minimumFractionDigits: 2, maximumFractionDigits: 2});
-      return `<td class="num">${t}</td>`;
+      if (v == null) return '<td class="num"></td>';
+      const f = fmt(r, c);
+      if (c === "涨跌幅") return `<td class="num ${f.cls}">${f.t}</td>`;
+      return `<td class="num">${fmt(r, c)}</td>`;
     }
     return `<td>${v ?? ""}</td>`;
   }).join("") + "</tr>").join("");
@@ -628,6 +765,63 @@ boot();
 </body>
 </html>
 """
+
+# ------------------------------------------------------------------ 自检 --
+
+def self_check(history: list[tuple[str, pd.DataFrame]]) -> str:
+    """对已归档数据做一次健康自检，返回一行结果文案。
+
+    返回 "" 表示健康；否则返回 "⚠ 自检异常：…" 形式的一句话。
+    检查项：字段合法性（必列缺失 / 涨跌幅越界 / 代码缺失）、
+    最新日期新鲜度、归档范围内是否有工作日缺口。
+    """
+    issues: list[str] = []
+    if not history:
+        return "⚠ 自检异常：无任何归档数据"
+
+    for ds, df in history:
+        if df.empty:
+            issues.append(f"{ds} 空文件")
+            continue
+        missing = [c for c in REQUIRED_COLS if c not in df.columns]
+        if missing:
+            issues.append(f"{ds} 缺列 {missing}")
+        if "涨跌幅" in df.columns:
+            chg = pd.to_numeric(df["涨跌幅"], errors="coerce")
+            if chg.isna().all():
+                issues.append(f"{ds} 涨跌幅全空")
+        if "股票代码" in df.columns and df["股票代码"].isna().any():
+            issues.append(f"{ds} 有股票代码缺失")
+
+    dates = sorted(ds for ds, _ in history)
+    latest = dates[-1]
+    days_ago = (datetime.now(CST).date()
+                - datetime.strptime(latest, "%Y%m%d").date()).days
+    if days_ago > 7:
+        issues.append(f"最新交易日 {latest} 距今 {days_ago} 天，可能已停更")
+
+    # 归档范围内的工作日缺口（非交易日已在台账里，不算缺口）
+    if len(dates) >= 2:
+        have = set(dates)
+        no_data = load_no_data()
+        d = datetime.strptime(dates[0], "%Y%m%d").date()
+        d1 = datetime.strptime(dates[-1], "%Y%m%d").date()
+        while d <= d1:
+            ds = d.strftime("%Y%m%d")
+            if d.weekday() < 5 and ds not in have and ds not in no_data:
+                issues.append(f"{ds} 工作日缺数据")
+                if len(issues) > 20:          # 缺口太多就截断，避免文案爆炸
+                    break
+            d += timedelta(days=1)
+
+    if issues:
+        return "⚠ 自检异常：" + "；".join(issues[:10])
+    return ""
+
+
+def _health_text(health: str) -> str:
+    return health if health else "✅ 自检通过"
+
 
 # ---------------------------------------------------------------- 邮件推送 --
 
@@ -719,13 +913,20 @@ def main() -> int:
     if no_data:
         logging.info("%s 无龙虎榜数据（非交易日或当日无个股上榜）", date_str)
 
-    # 看板无论当日有没有数据都要重新生成——否则非交易日那天 Pages 没产物可传
-    if not args.email_only:
+    # 看板无论当日有没有数据都要重新生成——否则非交易日那天 Pages 没产物可传。
+    # 顺带对全量历史做一次健康自检，结果写进看板和邮件。
+    health = ""
+    if args.email_only:
+        # 只发信也要带上自检结果（看板已在上一步生成并部署，不再重复生成）
+        health = self_check(collect_history())
+    else:
         history = collect_history()
-        index = write_site(history, date_str)
+        health = self_check(history)
+        index = write_site(history, date_str, health)
         logging.info("已生成 %s：%d 个交易日、%.1f KB（gzip 后约 1/2.4）",
                      index.relative_to(ROOT), len(history),
                      index.stat().st_size / 1024)
+    logging.info("自检：%s", _health_text(health))
 
     if no_data:
         logging.info("当日无数据，不发邮件")
@@ -739,10 +940,13 @@ def main() -> int:
         logging.warning("未提供 --page-url / PAGE_URL，邮件正文不含看板链接")
 
     stocks = df["股票代码"].nunique() if "股票代码" in df.columns else len(df)
+    health_tag = "自检异常" if health.startswith("⚠") else ""
+    subject = f"【龙虎榜{('·' + health_tag) if health_tag else ''}】" \
+              f"{_fmt_date(date_str)} 上榜 {stocks} 只"
     send_email(
-        subject=f"【龙虎榜】{_fmt_date(date_str)} 上榜 {stocks} 只",
-        text_body=build_body_text(df, date_str, page_url),
-        html_body=build_body_html(df, date_str, page_url),
+        subject=subject,
+        text_body=build_body_text(df, date_str, page_url, health=_health_text(health)),
+        html_body=build_body_html(df, date_str, page_url, health=_health_text(health)),
         attachments=[
             (f"lhb_{date_str}.parquet", parquet_path(date_str).read_bytes(), "octet-stream"),
         ],
