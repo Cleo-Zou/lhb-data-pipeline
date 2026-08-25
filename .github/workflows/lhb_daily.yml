@@ -50,15 +50,16 @@ jobs:
           pip install -r requirements.txt
 
       # 兜底层：万一某次 push 冲突没提交上，下次运行仍能从缓存拿回历史
-      # 注意 key 带 v2：换数据源（新浪→东方财富）后旧缓存的 schema 已不兼容，
-      # 若不改前缀，旧缓存会把 checkout 出来的新数据覆盖回去，导致自检报「缺列」。
+      # 注意 key 带版本号：每次改 parquet schema（列增减）都必须升一级，
+      # 否则旧缓存会把 checkout 出来的新 schema 覆盖回去，导致自检报「缺列」。
+      # v2 是新浪→东方财富（8→10 列），v3 是新增 8 个字段（10→18 列）。
       - name: 恢复数据缓存
         uses: actions/cache@v4
         with:
           path: data/
-          key: lhb-data-v2-${{ runner.os }}-${{ github.run_id }}
+          key: lhb-data-v3-${{ runner.os }}-${{ github.run_id }}
           restore-keys: |
-            lhb-data-v2-${{ runner.os }}-
+            lhb-data-v3-${{ runner.os }}-
 
       - name: 抓取数据并生成看板
         env:
