@@ -615,9 +615,15 @@ SHELL_HTML = r"""<!DOCTYPE html>
   table{border-collapse:collapse;width:100%;font-size:13px}
   #wrap{overflow-x:auto}
   th:last-child,td:last-child{min-width:260px;white-space:normal}
+  th[data-c="股票名称"],td[data-c="股票名称"]{min-width:130px}
   th{text-align:center;padding:9px 10px;border-bottom:2px solid var(--border);
-    color:var(--muted);font-size:12px;white-space:nowrap;cursor:pointer;user-select:none}
-  th:hover{color:var(--accent)}
+    color:var(--muted);font-size:12px;white-space:nowrap;user-select:none}
+  th .lbl{display:inline-block;vertical-align:middle;line-height:1.3}
+  th .sort{display:inline-flex;flex-direction:column;margin-left:5px;vertical-align:middle}
+  th .ar{display:block;padding:0;margin:0;border:none;background:none;
+    font-size:10px;line-height:1.05;color:var(--border);cursor:pointer}
+  th .ar.on{color:var(--accent)}
+  th .ar:hover{color:var(--accent)}
   th.num,td.num{text-align:center;font-variant-numeric:tabular-nums;white-space:nowrap}
   td.num.empty{color:var(--muted)}
   td{padding:8px 10px;border-bottom:1px solid var(--border)}
@@ -650,11 +656,14 @@ const DATA = __DATA__;
 const COLS = ["股票代码","股票名称","收盘价","涨跌幅","龙虎榜净买额","换手率","净买额占总成交比","成交额占总成交比","流通市值","市场总成交额","上榜后1日","上榜后2日","上榜后5日","上榜后10日","上榜原因"];
 const NUM  = new Set(["收盘价","涨跌幅","龙虎榜净买额","换手率","净买额占总成交比","成交额占总成交比","流通市值","市场总成交额","上榜后1日","上榜后2日","上榜后5日","上榜后10日"]);
 const SIGNED = new Set(["涨跌幅","净买额占总成交比","上榜后1日","上榜后2日","上榜后5日","上榜后10日"]);
+// 过长的「…占总成交比」标题拆成两行，列宽随之变窄
+const HEAD = {"净买额占总成交比":"净买额<br>占总成交比","成交额占总成交比":"成交额<br>占总成交比"};
+const headTitle = c => HEAD[c] || c;
 const $ = id => document.getElementById(id);
 
 let DATES = DATA.dates;
 let cur = "__TARGET__";
-let sortCol = null, sortAsc = false;
+let sortCol = null, sortDir = null;  // "asc" | "desc" | null（null=默认顺序）
 
 const compact = s => s.replace(/-/g, "");
 const dashed  = s => s.slice(0,4) + "-" + s.slice(4,6) + "-" + s.slice(6);
@@ -746,7 +755,7 @@ function render() {
       const x = val(a, sortCol), y = val(b, sortCol);
       const v = NUM.has(sortCol) ? (x ?? -Infinity) - (y ?? -Infinity)
                                  : String(x ?? "").localeCompare(String(y ?? ""), "zh");
-      return sortAsc ? v : -v;
+      return sortDir === "asc" ? v : -v;
     });
   }
 
@@ -756,25 +765,34 @@ function render() {
   if (!rows.length) { $("wrap").innerHTML = '<div class="msg">没有匹配的记录</div>'; return; }
 
   const head = COLS.map(c => {
-    const mark = sortCol === c ? (sortAsc ? " ↑" : " ↓") : "";
-    return `<th class="${NUM.has(c) ? "num" : ""}" data-c="${c}">${c}${mark}</th>`;
+    const onUp = sortCol === c && sortDir === "asc" ? " on" : "";
+    const onDn = sortCol === c && sortDir === "desc" ? " on" : "";
+    return `<th class="${NUM.has(c) ? "num" : ""}" data-c="${c}">` +
+      `<span class="lbl">${headTitle(c)}</span>` +
+      `<span class="sort">` +
+        `<button class="ar${onUp}" type="button" data-dir="asc" aria-label="升序">▲</button>` +
+        `<button class="ar${onDn}" type="button" data-dir="desc" aria-label="降序">▼</button>` +
+      `</span></th>`;
   }).join("");
 
   const body = rows.map(r => "<tr>" + COLS.map(c => {
     const v = val(r, c);
     if (NUM.has(c)) {
-      if (v == null) return '<td class="num empty">—</td>';
+      if (v == null) return `<td class="num empty" data-c="${c}">—</td>`;
       const f = fmt(r, c);
-      if (SIGNED.has(c)) return `<td class="num ${f.cls}">${f.t}</td>`;
-      return `<td class="num">${f}</td>`;
+      if (SIGNED.has(c)) return `<td class="num ${f.cls}" data-c="${c}">${f.t}</td>`;
+      return `<td class="num" data-c="${c}">${f}</td>`;
     }
-    return `<td>${v ?? ""}</td>`;
+    return `<td data-c="${c}">${v ?? ""}</td>`;
   }).join("") + "</tr>").join("");
 
   $("wrap").innerHTML = `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
-  $("wrap").querySelectorAll("th").forEach(th => th.onclick = () => {
-    const c = th.dataset.c;
-    if (sortCol === c) sortAsc = !sortAsc; else { sortCol = c; sortAsc = false; }
+  $("wrap").querySelectorAll("th .ar").forEach(btn => btn.onclick = () => {
+    const c = btn.closest("th").dataset.c;
+    const dir = btn.dataset.dir;
+    // 点同一个方向的箭头 → 取消排序，恢复默认顺序
+    if (sortCol === c && sortDir === dir) { sortCol = null; sortDir = null; }
+    else { sortCol = c; sortDir = dir; }
     render();
   });
 }
