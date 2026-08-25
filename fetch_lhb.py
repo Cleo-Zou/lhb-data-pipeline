@@ -596,7 +596,7 @@ SHELL_HTML = r"""<!DOCTYPE html>
   *{box-sizing:border-box}
   body{margin:0;padding:28px 16px;background:var(--bg);color:var(--fg);
     font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}
-  main{max-width:1760px;margin:0 auto}
+  main{max-width:1500px;margin:0 auto}
   h1{font-size:20px;margin:0 0 6px}
   .range{color:var(--muted);font-size:13px;margin:0 0 18px}
   .bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
@@ -615,10 +615,11 @@ SHELL_HTML = r"""<!DOCTYPE html>
   table{border-collapse:collapse;width:100%;font-size:13px}
   #wrap{overflow-x:auto}
   th:last-child,td:last-child{min-width:260px;white-space:normal}
-  th{text-align:left;padding:9px 10px;border-bottom:2px solid var(--border);
+  th{text-align:center;padding:9px 10px;border-bottom:2px solid var(--border);
     color:var(--muted);font-size:12px;white-space:nowrap;cursor:pointer;user-select:none}
   th:hover{color:var(--accent)}
-  th.num,td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+  th.num,td.num{text-align:center;font-variant-numeric:tabular-nums;white-space:nowrap}
+  td.num.empty{color:var(--muted)}
   td{padding:8px 10px;border-bottom:1px solid var(--border)}
   tbody tr:nth-child(even){background:var(--zebra)}
   .up{color:var(--up);font-weight:600}
@@ -762,7 +763,7 @@ function render() {
   const body = rows.map(r => "<tr>" + COLS.map(c => {
     const v = val(r, c);
     if (NUM.has(c)) {
-      if (v == null) return '<td class="num"></td>';
+      if (v == null) return '<td class="num empty">—</td>';
       const f = fmt(r, c);
       if (SIGNED.has(c)) return `<td class="num ${f.cls}">${f.t}</td>`;
       return `<td class="num">${f}</td>`;
