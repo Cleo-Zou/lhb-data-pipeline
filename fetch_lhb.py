@@ -614,8 +614,8 @@ SHELL_HTML = r"""<!DOCTYPE html>
   .health.bad{color:var(--warn);background:color-mix(in srgb,var(--warn) 12%,var(--bg));border:1px solid var(--warn)}
   table{border-collapse:collapse;width:100%;font-size:13px}
   #wrap{overflow-x:auto}
-  th:last-child,td:last-child{min-width:260px;white-space:normal}
-  th[data-c="股票名称"],td[data-c="股票名称"]{min-width:130px}
+  th:last-child,td:last-child{white-space:normal;text-align:center}
+  th[data-c="股票名称"],td[data-c="股票名称"]{white-space:nowrap;text-align:center}
   th{text-align:center;padding:9px 10px;border-bottom:2px solid var(--border);
     color:var(--muted);font-size:12px;white-space:nowrap;user-select:none}
   th .lbl{display:inline-block;vertical-align:middle;line-height:1.3}
@@ -767,12 +767,14 @@ function render() {
   const head = COLS.map(c => {
     const onUp = sortCol === c && sortDir === "asc" ? " on" : "";
     const onDn = sortCol === c && sortDir === "desc" ? " on" : "";
-    return `<th class="${NUM.has(c) ? "num" : ""}" data-c="${c}">` +
-      `<span class="lbl">${headTitle(c)}</span>` +
+    // 股票名称不加排序箭头
+    const arrows = c === "股票名称" ? "" :
       `<span class="sort">` +
         `<button class="ar${onUp}" type="button" data-dir="asc" aria-label="升序">▲</button>` +
         `<button class="ar${onDn}" type="button" data-dir="desc" aria-label="降序">▼</button>` +
-      `</span></th>`;
+      `</span>`;
+    return `<th class="${NUM.has(c) ? "num" : ""}" data-c="${c}">` +
+      `<span class="lbl">${headTitle(c)}</span>${arrows}</th>`;
   }).join("");
 
   const body = rows.map(r => "<tr>" + COLS.map(c => {
