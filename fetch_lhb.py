@@ -51,7 +51,11 @@ AMOUNT_COL_CANDIDATES = ("龙虎榜净买额", "龙虎榜成交额", "换手率"
 
 # 看板/邮件正文展示的列（顺序即展示顺序）
 DISPLAY_COLS = ["股票代码", "股票名称", "收盘价", "涨跌幅",
-                "龙虎榜净买额", "换手率", "上榜原因"]
+                "龙虎榜净买额", "换手率",
+                "净买额占总成交比", "成交额占总成交比",
+                "流通市值", "市场总成交额",
+                "上榜后1日", "上榜后2日", "上榜后5日", "上榜后10日",
+                "上榜原因"]
 
 # 自检必查的列：任何一个 parquet 缺了这些列就算异常
 REQUIRED_COLS = ("股票代码", "股票名称", "收盘价", "涨跌幅", "龙虎榜净买额", "上榜原因")
@@ -59,10 +63,13 @@ REQUIRED_COLS = ("股票代码", "股票名称", "收盘价", "涨跌幅", "龙�
 # 东方财富原始列名 -> 本项目统一列名（其余同名列原样保留）
 COLUMN_MAP = {"代码": "股票代码", "名称": "股票名称"}
 
-# 落盘时保留的列（展示列 + 买入/卖出/成交额，附件 parquet 里更完整）
+# 落盘时保留的列（展示列 + 买入/卖出/成交额 + 占比/市值/上榜后表现，附件 parquet 里最完整）
 KEEP_COLS = ["股票代码", "股票名称", "收盘价", "涨跌幅",
              "龙虎榜净买额", "龙虎榜买入额", "龙虎榜卖出额", "龙虎榜成交额",
-             "换手率", "上榜原因"]
+             "换手率", "流通市值", "市场总成交额",
+             "净买额占总成交比", "成交额占总成交比",
+             "上榜后1日", "上榜后2日", "上榜后5日", "上榜后10日",
+             "上榜原因"]
 
 EXIT_OK = 0
 EXIT_FETCH_FAILED = 1
@@ -349,15 +356,18 @@ def _fmt_date(date_str: str) -> str:
 
 
 def _fmt_val(col: str, v) -> str:
-    """数值列的展示格式化：涨跌幅/换手率带 %，净买额折成万元。"""
+    """数值列的展示格式化：涨跌幅/占比/上榜后带 %，金额折成万/亿。"""
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return ""
-    if col == "涨跌幅":
+    if col in ("涨跌幅", "上榜后1日", "上榜后2日", "上榜后5日", "上榜后10日",
+               "净买额占总成交比"):
         return f"{v:+.2f}%"
-    if col == "换手率":
+    if col in ("换手率", "成交额占总成交比"):
         return f"{v:.2f}%"
     if col == "龙虎榜净买额":
         return f"{v / 1e4:,.0f}万"
+    if col in ("流通市值", "市场总成交额"):
+        return f"{v / 1e8:,.2f}亿"
     if col == "收盘价":
         return f"{v:.2f}"
     return str(v)
@@ -384,7 +394,9 @@ def build_body_html(df: pd.DataFrame, date_str: str, page_url: str = "",
           "text-align:left;color:#656d76;font-weight:600;white-space:nowrap;")
     num = td + "text-align:right;font-variant-numeric:tabular-nums;"
 
-    cols = [c for c in DISPLAY_COLS if c in view.columns]
+    # 上榜后N日对「昨天」这类最新日期整列是 NaN，邮件里整列空白没意义，动态剔除
+    cols = [c for c in DISPLAY_COLS
+            if c in view.columns and view[c].notna().any()]
 
     rows = []
     for i, (_, r) in enumerate(view.head(top).iterrows()):
@@ -527,6 +539,14 @@ def write_site(history: list[tuple[str, pd.DataFrame]], target: str,
             "chg": col(view, "涨跌幅"),
             "net": col(view, "龙虎榜净买额"),
             "turn": col(view, "换手率"),
+            "netr": col(view, "净买额占总成交比"),
+            "dealr": col(view, "成交额占总成交比"),
+            "cap": col(view, "流通市值"),
+            "amt": col(view, "市场总成交额"),
+            "d1": col(view, "上榜后1日"),
+            "d2": col(view, "上榜后2日"),
+            "d5": col(view, "上榜后5日"),
+            "d10": col(view, "上榜后10日"),
             "r": inds,            # 上榜原因 -> reasons 下标
         }
         dates.append(date_str)
@@ -622,8 +642,9 @@ SHELL_HTML = r"""<!DOCTYPE html>
 </main>
 <script>
 const DATA = __DATA__;
-const COLS = ["股票代码","股票名称","收盘价","涨跌幅","龙虎榜净买额","换手率","上榜原因"];
-const NUM  = new Set(["收盘价","涨跌幅","龙虎榜净买额","换手率"]);
+const COLS = ["股票代码","股票名称","收盘价","涨跌幅","龙虎榜净买额","换手率","净买额占总成交比","成交额占总成交比","流通市值","市场总成交额","上榜后1日","上榜后2日","上榜后5日","上榜后10日","上榜原因"];
+const NUM  = new Set(["收盘价","涨跌幅","龙虎榜净买额","换手率","净买额占总成交比","成交额占总成交比","流通市值","市场总成交额","上榜后1日","上榜后2日","上榜后5日","上榜后10日"]);
+const SIGNED = new Set(["涨跌幅","净买额占总成交比","上榜后1日","上榜后2日","上榜后5日","上榜后10日"]);
 const $ = id => document.getElementById(id);
 
 let DATES = DATA.dates;
@@ -643,6 +664,8 @@ function rowsOf(d) {
       code:  p.c[k],
       name:  p.n[k] != null ? DATA.names[p.n[k]] : "",
       close: p.close[k], chg: p.chg[k], net: p.net[k], turn: p.turn[k],
+      netr: p.netr[k], dealr: p.dealr[k], cap: p.cap[k], amt: p.amt[k],
+      d1: p.d1[k], d2: p.d2[k], d5: p.d5[k], d10: p.d10[k],
       reason: p.r[k] != null ? DATA.reasons[p.r[k]] : "",
     };
   }
@@ -651,14 +674,20 @@ function rowsOf(d) {
 const val = (r, c) =>
   c === "股票代码" ? r.code : c === "股票名称" ? r.name :
   c === "收盘价" ? r.close : c === "涨跌幅" ? r.chg :
-  c === "龙虎榜净买额" ? r.net : c === "换手率" ? r.turn : r.reason;
+  c === "龙虎榜净买额" ? r.net : c === "换手率" ? r.turn :
+  c === "净买额占总成交比" ? r.netr : c === "成交额占总成交比" ? r.dealr :
+  c === "流通市值" ? r.cap : c === "市场总成交额" ? r.amt :
+  c === "上榜后1日" ? r.d1 : c === "上榜后2日" ? r.d2 :
+  c === "上榜后5日" ? r.d5 : c === "上榜后10日" ? r.d10 :
+  r.reason;
 
 function fmt(r, c) {
   const v = val(r, c);
   if (v == null) return "";
-  if (c === "涨跌幅") return {t: (v > 0 ? "+" : "") + Number(v).toFixed(2) + "%", cls: v >= 0 ? "up" : "down"};
-  if (c === "换手率") return Number(v).toFixed(2) + "%";
+  if (SIGNED.has(c)) return {t: (v > 0 ? "+" : "") + Number(v).toFixed(2) + "%", cls: v >= 0 ? "up" : "down"};
+  if (c === "换手率" || c === "成交额占总成交比") return Number(v).toFixed(2) + "%";
   if (c === "龙虎榜净买额") return (Number(v) / 1e4).toLocaleString("zh-CN", {maximumFractionDigits: 0}) + "万";
+  if (c === "流通市值" || c === "市场总成交额") return (Number(v) / 1e8).toLocaleString("zh-CN", {minimumFractionDigits: 2, maximumFractionDigits: 2}) + "亿";
   if (c === "收盘价") return Number(v).toFixed(2);
   return v;
 }
@@ -731,8 +760,8 @@ function render() {
     if (NUM.has(c)) {
       if (v == null) return '<td class="num"></td>';
       const f = fmt(r, c);
-      if (c === "涨跌幅") return `<td class="num ${f.cls}">${f.t}</td>`;
-      return `<td class="num">${fmt(r, c)}</td>`;
+      if (SIGNED.has(c)) return `<td class="num ${f.cls}">${f.t}</td>`;
+      return `<td class="num">${f}</td>`;
     }
     return `<td>${v ?? ""}</td>`;
   }).join("") + "</tr>").join("");
