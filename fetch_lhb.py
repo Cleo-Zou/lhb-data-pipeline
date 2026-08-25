@@ -361,57 +361,84 @@ def build_body_text(df: pd.DataFrame, date_str: str,
 
 
 def write_site(history: list[tuple[str, pd.DataFrame]], target: str) -> Path:
-    """生成 output/：index.html 外壳 + 按日拆分的 JSON。
+    """生成自包含的 output/index.html：所有数据内嵌，页面零 fetch。
 
-    数据按日拆开、页面按需 fetch，所以归档几年也不影响首屏加载。
+    采用列式编码（每列一个数组）+ 股票名称/指标文案全局去重，把体积压到
+    行式 JSON 的约 1/3。浏览器只加载 index.html 一个文件，彻底绕开
+    「子资源 fetch 被代理/安全软件拦截」这类问题。
     """
-    site_data = OUTPUT_DIR / "data"
-    site_data.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    indicators: list[str] = []      # 指标文案全局去重，行里只存下标
+    names: list[str] = []          # 股票名称去重表
+    name_index: dict[str, int] = {}
+    indicators: list[str] = []     # 指标文案去重表
     ind_index: dict[str, int] = {}
+
+    def intern_name(n: str) -> int:
+        if n not in name_index:
+            name_index[n] = len(names)
+            names.append(n)
+        return name_index[n]
+
+    def col(view: pd.DataFrame, c: str) -> list:
+        if c not in view.columns:
+            return [None] * len(view)
+        return view[c].where(pd.notna(view[c]), None).tolist()
+
     dates: list[str] = []
+    by_date: dict[str, dict] = {}
 
     for date_str, df in history:
         _, view = summarize(df)
         view = view.drop(columns=[c for c in ("序号",) if c in view.columns])
-        # NaN 不是合法 JSON，转成 None
-        rows = view.where(pd.notna(view), None).to_dict(orient="records")
-        for r in rows:
-            ind = r.pop("指标", None)
-            if ind is not None:
-                if ind not in ind_index:
-                    ind_index[ind] = len(indicators)
-                    indicators.append(ind)
-                r["i"] = ind_index[ind]
 
-        (site_data / f"{date_str}.json").write_text(
-            json.dumps({
-                "rows": rows,
-                "total": int(len(df)),
-                "stocks": int(df["股票代码"].nunique())
-                          if "股票代码" in df.columns else int(len(df)),
-            }, ensure_ascii=False, separators=(",", ":")),
-            encoding="utf-8",
-        )
+        code = view["股票代码"].astype(str).tolist() if "股票代码" in view.columns else []
+        name = [intern_name(str(v)) for v in view["股票名称"]] if "股票名称" in view.columns else []
+
+        inds: list[int | None] = []
+        if "指标" in view.columns:
+            for v in view["指标"]:
+                s = str(v)
+                if s not in ind_index:
+                    ind_index[s] = len(indicators)
+                    indicators.append(s)
+                inds.append(ind_index[s])
+        else:
+            inds = [None] * len(view)
+
+        by_date[date_str] = {
+            "total": int(len(df)),
+            "stocks": int(df["股票代码"].nunique())
+                      if "股票代码" in df.columns else int(len(df)),
+            "c": code,          # 股票代码
+            "n": name,          # 股票名称 -> names 下标
+            "close": col(view, "收盘价"),
+            "val": col(view, "对应值"),
+            "vol": col(view, "成交量"),
+            "amt": col(view, "成交额"),
+            "i": inds,          # 指标 -> indicators 下标
+        }
         dates.append(date_str)
 
     dates.sort(reverse=True)
-    (site_data / "manifest.json").write_text(
-        json.dumps({
-            "dates": dates,
-            "indicators": indicators,
-            "generated": datetime.now(CST).strftime("%Y-%m-%d %H:%M"),
-        }, ensure_ascii=False, separators=(",", ":")),
-        encoding="utf-8",
-    )
+    payload = {
+        "dates": dates,
+        "names": names,
+        "indicators": indicators,
+        "byDate": by_date,
+        "generated": datetime.now(CST).strftime("%Y-%m-%d %H:%M"),
+    }
+    data_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
 
     index = OUTPUT_DIR / "index.html"
-    index.write_text(SHELL_HTML.replace("__TARGET__", target), encoding="utf-8")
+    index.write_text(
+        SHELL_HTML.replace("__DATA__", data_json).replace("__TARGET__", target),
+        encoding="utf-8",
+    )
     return index
 
 
-# 页面外壳。用普通字符串 + 占位符替换，不用 f-string——JS 里全是花括号，
+# 自包含页面外壳。用普通字符串 + 占位符替换，不用 f-string——JS 里全是花括号，
 # f-string 需要把每一个都写成 {{ }}，可读性会毁掉。
 SHELL_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -455,7 +482,6 @@ SHELL_HTML = r"""<!DOCTYPE html>
   tbody tr:nth-child(even){background:var(--zebra)}
   .msg{padding:36px 0;text-align:center;color:var(--muted)}
   .msg.warn{color:var(--warn)}
-  code{background:var(--zebra);padding:1px 5px;border-radius:4px;font-size:12px}
   footer{margin-top:28px;padding-top:14px;border-top:1px solid var(--border);
     color:var(--muted);font-size:12px}
 </style>
@@ -476,82 +502,73 @@ SHELL_HTML = r"""<!DOCTYPE html>
   <footer id="foot"></footer>
 </main>
 <script>
+const DATA = __DATA__;
 const COLS = ["股票代码","股票名称","收盘价","对应值","成交量","成交额","指标"];
 const NUM  = new Set(["收盘价","对应值","成交量","成交额"]);
 const $ = id => document.getElementById(id);
 
-let MAN = null;            // manifest：可用日期 + 指标文案表
-let DATES = [];            // 倒序
+let DATES = DATA.dates;
 let cur = "__TARGET__";
-let cache = {};            // 已 fetch 过的日期
 let sortCol = null, sortAsc = false;
 
 const compact = s => s.replace(/-/g, "");
 const dashed  = s => s.slice(0,4) + "-" + s.slice(4,6) + "-" + s.slice(6);
-const val = (r, c) => c === "指标" ? (MAN.indicators[r.i] ?? "") : r[c];
 
-async function boot() {
-  try {
-    MAN = await (await fetch("data/manifest.json", {cache: "no-cache"})).json();
-  } catch (e) {
-    $("wrap").innerHTML = '<div class="msg warn">读取 manifest.json 失败。' +
-      '<br>本地预览请用 <code>python -m http.server</code> 起服务——' +
-      '直接双击打开 file:// 会被浏览器同源策略拦住。</div>';
-    return;
+// 列式数据按行拼回对象（每天最多百余行，开销可忽略）
+function rowsOf(d) {
+  const p = DATA.byDate[d];
+  if (!p) return [];
+  const out = new Array(p.c.length);
+  for (let k = 0; k < p.c.length; k++) {
+    out[k] = {
+      code:  p.c[k],
+      name:  p.n[k] != null ? DATA.names[p.n[k]] : "",
+      close: p.close[k], val: p.val[k], vol: p.vol[k], amt: p.amt[k],
+      ind:   p.i[k] != null ? DATA.indicators[p.i[k]] : "",
+    };
   }
-  DATES = MAN.dates;
-  if (!DATES.length) { $("wrap").innerHTML = '<div class="msg">暂无归档数据</div>'; return; }
+  return out;
+}
+const val = (r, c) =>
+  c === "股票代码" ? r.code : c === "股票名称" ? r.name :
+  c === "收盘价" ? r.close : c === "对应值" ? r.val :
+  c === "成交量" ? r.vol : c === "成交额" ? r.amt : r.ind;
 
+function boot() {
+  if (!DATES.length) { $("wrap").innerHTML = '<div class="msg">暂无归档数据</div>'; return; }
   $("picker").min = dashed(DATES[DATES.length - 1]);
   $("picker").max = dashed(DATES[0]);
   $("quick").innerHTML = DATES.map(d => `<option value="${d}">${dashed(d)}</option>`).join("");
   $("range").textContent =
     `已归档 ${DATES.length} 个交易日：${dashed(DATES[DATES.length-1])} ~ ${dashed(DATES[0])}`;
   $("foot").textContent =
-    `数据来源：新浪财经（akshare） · 生成于 ${MAN.generated} (UTC+8)`;
-
+    `数据来源：新浪财经（akshare） · 生成于 ${DATA.generated} (UTC+8) · 单文件版`;
   if (!DATES.includes(cur)) cur = DATES[0];
-  await show(cur);
+  show(cur);
 }
 
-// 选到非交易日时退到最近的已归档日（先往前找，找不到再取最早那天）
 function nearest(d) {
   if (DATES.includes(d)) return d;
   const earlier = DATES.find(x => x < d);
   return earlier || DATES[DATES.length - 1];
 }
 
-async function load(d) {
-  if (cache[d]) return cache[d];
-  const r = await fetch(`data/${d}.json`, {cache: "no-cache"});
-  if (!r.ok) throw new Error("HTTP " + r.status);
-  cache[d] = await r.json();
-  return cache[d];
-}
-
-async function show(d) {
+function show(d) {
   cur = d;
   $("picker").value = dashed(d);
   $("quick").value = d;
   const i = DATES.indexOf(d);
-  $("prev").disabled = i >= DATES.length - 1;    // DATES 倒序，索引大 = 更早
+  $("prev").disabled = i >= DATES.length - 1;
   $("next").disabled = i <= 0;
-  $("wrap").innerHTML = '<div class="msg">加载中…</div>';
-  try {
-    await load(d);
-  } catch (e) {
-    $("stat").textContent = "";
-    $("wrap").innerHTML = `<div class="msg warn">${dashed(d)} 加载失败：${e.message}</div>`;
-    return;
-  }
   render();
 }
 
 function render() {
-  const pack = cache[cur];
-  if (!pack) return;
+  const p = DATA.byDate[cur];
+  if (!p) return;
   const kw = $("q").value.trim().toLowerCase();
-  let rows = pack.rows.filter(r => !kw ||
+  let rows = rowsOf(cur);
+  if (kw) rows = rows.filter(r =>
     COLS.some(c => String(val(r, c) ?? "").toLowerCase().includes(kw)));
 
   if (sortCol) {
@@ -563,8 +580,8 @@ function render() {
     });
   }
 
-  $("stat").innerHTML = `${dashed(cur)} · 上榜记录 <b>${pack.total}</b> 条 · ` +
-    `涉及个股 <b>${pack.stocks}</b> 只` + (kw ? ` · 筛选出 <b>${rows.length}</b> 行` : "");
+  $("stat").innerHTML = `${dashed(cur)} · 上榜记录 <b>${p.total}</b> 条 · ` +
+    `涉及个股 <b>${p.stocks}</b> 只` + (kw ? ` · 筛选出 <b>${rows.length}</b> 行` : "");
 
   if (!rows.length) { $("wrap").innerHTML = '<div class="msg">没有匹配的记录</div>'; return; }
 
@@ -595,12 +612,11 @@ $("picker").onchange = () => {
   const want = compact($("picker").value);
   if (!want) return;
   const got = nearest(want);
-  show(got).then(() => {
-    if (got !== want) {
-      $("stat").innerHTML += ` · <span style="color:var(--warn)">` +
-        `${dashed(want)} 非交易日或未归档，已跳到 ${dashed(got)}</span>`;
-    }
-  });
+  show(got);
+  if (got !== want) {
+    $("stat").innerHTML += ` · <span style="color:var(--warn)">` +
+      `${dashed(want)} 非交易日或未归档，已跳到 ${dashed(got)}</span>`;
+  }
 };
 $("quick").onchange = () => show($("quick").value);
 $("prev").onclick = () => show(DATES[Math.min(DATES.indexOf(cur) + 1, DATES.length - 1)]);
@@ -612,7 +628,6 @@ boot();
 </body>
 </html>
 """
-
 
 # ---------------------------------------------------------------- 邮件推送 --
 
@@ -708,10 +723,9 @@ def main() -> int:
     if not args.email_only:
         history = collect_history()
         index = write_site(history, date_str)
-        total = sum(f.stat().st_size for f in OUTPUT_DIR.rglob("*") if f.is_file())
-        logging.info("已生成 %s：%d 个交易日，外壳 %.1f KB，全站 %.1f KB",
+        logging.info("已生成 %s：%d 个交易日、%.1f KB（gzip 后约 1/2.4）",
                      index.relative_to(ROOT), len(history),
-                     index.stat().st_size / 1024, total / 1024)
+                     index.stat().st_size / 1024)
 
     if no_data:
         logging.info("当日无数据，不发邮件")

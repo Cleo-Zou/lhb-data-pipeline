@@ -33,15 +33,18 @@ GitHub Actions (工作日北京时间 16:00)
 
 ### 页面结构
 
+整个看板是**一个自包含的 `output/index.html`**，所有数据内嵌，页面零网络请求。
+3 年历史压到约 2.4 MB（列式编码 + 股票名/指标去重），GitHub Pages 再 gzip 到约 1 MB。
+
 ```
 output/
-  index.html            # 外壳，7.7 KB，不随历史增长
-  data/manifest.json    # 可用日期清单 + 指标文案表
-  data/20260821.json    # 单日数据，约 7.6 KB，切到哪天才 fetch 哪天
+  index.html            # 唯一的产物：数据全在内，没有任何子资源请求
 ```
 
-一开始是把所有数据塞进单个 HTML 的，10 KB/交易日——3 年历史会变成 7 MB 的首屏。
-拆成按日 JSON 之后首屏恒定 7.7 KB，归档再深也不影响打开速度。
+为什么做成单文件：之前拆成「外壳 + 按日 JSON、按需 fetch」，架构上更轻，但在部分
+网络环境下，浏览器对 `data/*.json` 的 fetch 会被代理/安全软件拦截，导致「读取
+manifest.json 失败」。单文件版只加载 `index.html` 一个文件，不存在可被拦截的子资源，
+`file://` 双击打开、离线、换网络都可用。代价是首屏约 1 MB（gzip），桌面端无感。
 
 ## 邮件里有什么
 
@@ -142,8 +145,7 @@ python fetch_lhb.py --date 2026-08-21            # 抓取 + 生成 + 发信（�
 python fetch_lhb.py --email-only --page-url URL  # 只发信，复用已有 parquet
 ```
 
-本地预览看板要起一个 HTTP 服务，**不能直接双击打开** `output/index.html`——
-页面按需 `fetch` 单日 JSON，`file://` 协议会被浏览器同源策略拦住（页面会给出提示）：
+看板是自包含单文件，**双击 `output/index.html` 就能直接打开**，也可以起个服务再访问：
 
 ```bash
 cd output && python -m http.server 8000    # 然后访问 http://localhost:8000
@@ -166,8 +168,8 @@ $env:EMAIL_RECEIVER="a@163.com"; $env:SMTP_SERVER="smtp.163.com"; $env:SMTP_PORT
   （如 `ak.stock_lhb_jgmmtj_em`），`AMOUNT_COL_CANDIDATES` 会自动优先用它。
 - **同一只股票可能有多行**：命中多个上榜指标就会重复出现。parquet 保留全部原始行，
   展示时按股票代码去重，所以「上榜记录」数会大于「涉及个股」数。
-- **看板体积**：外壳恒定 7.7 KB，单日 JSON 约 7.6 KB 按需加载，归档多深都不影响
-  首屏。全站大小每次运行都会打进日志。
+- **看板体积**：自包含单文件，3 年历史约 2.4 MB（gzip 约 1 MB）。归档每多一年约加
+  800 KB。实际大小每次运行都会打进日志。
 - **Pages 是公开的**：public 仓库的 Pages 任何人都能访问。龙虎榜本身是公开数据，
   但要知道这一点。
 - 非交易日、接口无数据时跳过发信，退出码 0（Actions 不会标红）。
